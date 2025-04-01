@@ -11,6 +11,22 @@
 #define BANDWIDTH_MAX  "99999"
 #define BANDWIDTH_DEFAULT 10
 
+typedef struct {
+    int bandwidth;  // in KB/s
+    int duration;  // in milliseconds
+} BandwidthConfig;
+
+static BandwidthConfig *bandwidthConfigs = NULL;
+static int configCount = 0;
+static int currentConfigIndex = 0;
+static DWORD lastConfigChangeTime = 0;
+
+//---------------------------------------------------------------------
+// log file
+//---------------------------------------------------------------------
+
+#define LOG_FILE "log.txt"
+
 //---------------------------------------------------------------------
 // rate stats
 //---------------------------------------------------------------------
@@ -43,24 +59,73 @@ int32_t crate_stats_calculate(CRateStats *rate, uint32_t now_ts);
 //---------------------------------------------------------------------
 // configuration
 //---------------------------------------------------------------------
-static Ihandle *inboundCheckbox, *outboundCheckbox, *bandwidthInput;
+static Ihandle *inboundCheckbox, *outboundCheckbox, *bandwidthInput, *currentBandwidthLabel, *useConfigCheckbox;
 
 static volatile short bandwidthEnabled = 0,
-    bandwidthInbound = 1, bandwidthOutbound = 1;
+    bandwidthInbound = 1, bandwidthOutbound = 1, useConfig = 1;
 
 static volatile LONG bandwidthLimit = BANDWIDTH_DEFAULT; 
 static CRateStats *rateStats = NULL;
 
+static void readBandwidthConfig() {
+    FILE *file = fopen("bandwidth.txt", "r");
+    if (file == NULL) {
+		// write to log file
+		FILE *logFile = fopen(LOG_FILE, "a");
+		if (logFile) {
+			fprintf(logFile, "Failed to open bandwidth.txt in this directory: %s\n", getcwd(NULL, 0));
+			fclose(logFile);
+		}
+        return;
+    }
+
+    int lineCount = 0;
+    char line[100];
+    while (fgets(line, sizeof(line), file) != NULL) {
+        lineCount++;
+    }
+    rewind(file);
+
+    bandwidthConfigs = (BandwidthConfig *)malloc(lineCount * sizeof(BandwidthConfig));
+    if (bandwidthConfigs == NULL) {
+        LOG("Failed to allocate memory for bandwidth configs");
+        fclose(file);
+        return;
+    }
+
+    configCount = 0;
+    while (fgets(line, sizeof(line), file) != NULL) {
+        int bandwidth, duration;
+        if (sscanf(line, "%d %d", &bandwidth, &duration) == 2) {
+            bandwidthConfigs[configCount].bandwidth = bandwidth / 8;
+            bandwidthConfigs[configCount].duration = duration;
+            configCount++;
+        }
+    }
+
+    fclose(file);
+}
+
+static int onUseConfigToggled(Ihandle *self)
+{
+    int useCfg = IupGetInt(self, "VALUE");
+	useConfig = useCfg;
+    IupSetAttribute(bandwidthInput, "ACTIVE", useCfg ? "NO" : "YES");
+    return IUP_DEFAULT;
+}
 
 static Ihandle* bandwidthSetupUI() {
     Ihandle *bandwidthControlsBox = IupHbox(
+		currentBandwidthLabel = IupLabel("N/A"),
+		useConfigCheckbox = IupToggle("Use config", NULL),
         inboundCheckbox = IupToggle("Inbound", NULL),
         outboundCheckbox = IupToggle("Outbound", NULL),
-        IupLabel("Limit(KB/s):"),
+        IupLabel("Limit(kB/s):"),
         bandwidthInput = IupText(NULL),
         NULL
     );
 
+	IupSetAttribute(currentBandwidthLabel, "RASTERSIZE", "150x20");
     IupSetAttribute(bandwidthInput, "VISIBLECOLUMNS", "4");
     IupSetAttribute(bandwidthInput, "VALUE", STR(BANDWIDTH_DEFAULT));
     IupSetCallback(bandwidthInput, "VALUECHANGED_CB", uiSyncInt32);
@@ -71,23 +136,46 @@ static Ihandle* bandwidthSetupUI() {
     IupSetAttribute(inboundCheckbox, SYNCED_VALUE, (char*)&bandwidthInbound);
     IupSetCallback(outboundCheckbox, "ACTION", (Icallback)uiSyncToggle);
     IupSetAttribute(outboundCheckbox, SYNCED_VALUE, (char*)&bandwidthOutbound);
+	IupSetCallback(useConfigCheckbox, "ACTION", (Icallback)onUseConfigToggled);
+	IupSetAttribute(useConfigCheckbox, SYNCED_VALUE, (char*)&useConfig);
+	IupSetAttribute(bandwidthInput, "ACTIVE", useConfig ? "NO" : "YES");
 
     // enable by default to avoid confusing
     IupSetAttribute(inboundCheckbox, "VALUE", "ON");
     IupSetAttribute(outboundCheckbox, "VALUE", "ON");
+	IupSetAttribute(useConfigCheckbox, "VALUE", "ON");
 
     if (parameterized) {
         setFromParameter(inboundCheckbox, "VALUE", NAME"-inbound");
         setFromParameter(outboundCheckbox, "VALUE", NAME"-outbound");
         setFromParameter(bandwidthInput, "VALUE", NAME"-bandwidth");
+        setFromParameter(useConfigCheckbox, "VALUE", NAME"-useconfig");
     }
 
     return bandwidthControlsBox;
 }
 
 static void bandwidthStartUp() {
+	// ensure log file is created
+	FILE *logFile = fopen(LOG_FILE, "a");
+	if (logFile) fclose(logFile);
+
 	if (rateStats) crate_stats_delete(rateStats);
 	rateStats = crate_stats_new(1000, 1000);
+    readBandwidthConfig();
+    currentConfigIndex = 0;
+    lastConfigChangeTime = timeGetTime();
+    if (useConfig && configCount > 0) {
+        bandwidthLimit = bandwidthConfigs[0].bandwidth;
+    } else {
+		bandwidthLimit = atol(IupGetAttribute(bandwidthInput, "VALUE"));
+	}
+    if (configCount > 0 || !useConfig) {
+        char labelText[50];
+        sprintf(labelText, "%dkbps", bandwidthLimit * 8);
+        IupSetAttribute(currentBandwidthLabel, "TITLE", labelText);
+		IupRefresh(currentBandwidthLabel);
+    }
     LOG("bandwidth enabled");
 }
 
@@ -96,6 +184,11 @@ static void bandwidthCloseDown(PacketNode *head, PacketNode *tail) {
     UNREFERENCED_PARAMETER(tail);
 	if (rateStats) crate_stats_delete(rateStats);
 	rateStats = NULL;
+    if (bandwidthConfigs) {
+        free(bandwidthConfigs);
+        bandwidthConfigs = NULL;
+        configCount = 0;
+    }
     LOG("bandwidth disabled");
 }
 
@@ -106,7 +199,28 @@ static void bandwidthCloseDown(PacketNode *head, PacketNode *tail) {
 static short bandwidthProcess(PacketNode *head, PacketNode* tail) {
     int dropped = 0;
 	DWORD now_ts = timeGetTime();
-	int limit = bandwidthLimit * 1024;
+
+    if (useConfig && configCount > 0) {
+        DWORD elapsedTime = now_ts - lastConfigChangeTime;
+        if (elapsedTime >= bandwidthConfigs[currentConfigIndex].duration) {
+            currentConfigIndex = (currentConfigIndex + 1) % configCount;
+            bandwidthLimit = bandwidthConfigs[currentConfigIndex].bandwidth;
+            lastConfigChangeTime = now_ts;
+            LOG("Switched to bandwidth %dkB/s for %dms", bandwidthLimit, bandwidthConfigs[currentConfigIndex].duration);
+            char labelText[50];
+            sprintf(labelText, "%dkbps", bandwidthLimit * 8);
+            IupSetAttribute(currentBandwidthLabel, "TITLE", labelText);
+			IupRefresh(currentBandwidthLabel);
+        }
+    } else {
+        bandwidthLimit = atol(IupGetAttribute(bandwidthInput, "VALUE"));
+        char labelText[50];
+        sprintf(labelText, "%dkbps", bandwidthLimit * 8);
+        IupSetAttribute(currentBandwidthLabel, "TITLE", labelText);
+		IupRefresh(currentBandwidthLabel);
+    }
+
+	int limit = bandwidthLimit * 1000;
 
 	//	allow 0 limit which should drop all
 	if (limit < 0 || rateStats == NULL) {
@@ -120,8 +234,14 @@ static short bandwidthProcess(PacketNode *head, PacketNode* tail) {
         if (checkDirection(pac->addr.Outbound, bandwidthInbound, bandwidthOutbound)) {
 			int rate = crate_stats_calculate(rateStats, now_ts);
 			int size = pac->packetLen;
+			// write to log file
+			FILE *logFile = fopen(LOG_FILE, "a");
+			if (logFile) {
+				fprintf(logFile, "Calc Rate: %d B/s, New packet size: %d bytes, Limit: %d B/s\n", rate, size, limit);
+				fclose(logFile);
+			}
 			if (rate + size > limit) {
-				LOG("dropped with bandwidth %dKB/s, direction %s",
+				LOG("dropped with bandwidth %dkB/s, direction %s",
 					(int)bandwidthLimit, pac->addr.Outbound ? "OUTBOUND" : "INBOUND");
 				discard = 1;
 			}
@@ -136,7 +256,6 @@ static short bandwidthProcess(PacketNode *head, PacketNode* tail) {
             head = head->next;
         }
     }
-
     return dropped > 0;
 }
 
